@@ -1,0 +1,28 @@
+service: wos-scraper-lambda
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: eu-west-3  # Paris
+  memorySize: 256
+  timeout: 30
+  environment:
+    API_BASE: https://wosforge.org/WPDS/api
+    BATCH_SIZE: 100
+
+functions:
+  scraper:
+    handler: index.handler
+    reservedConcurrency: 1000  # Max 1000 instances concurrentes (FREE TIER)
+    events:
+      # Trigger toutes les 1 minute via EventBridge
+      - schedule:
+          rate: rate(1 minute)
+          enabled: true
+
+plugins:
+  - serverless-offline
+
+package:
+  patterns:
+    - index.mjs
