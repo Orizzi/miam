@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: wos-scraper-render
+    runtime: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm install
+    startCommand: node worker.js
+    envVars:
+      - key: API_BASE
+        value: https://wosforge.org/WPDS/api
+      - key: BATCH_SIZE
+        value: 100
+      - key: WORKER_ID
+        value: render-1
