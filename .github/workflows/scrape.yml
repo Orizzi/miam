@@ -1,0 +1,66 @@
+name: WOS Distributed Scraper
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Toutes les 5 minutes
+  workflow_dispatch:  # Permet lancement manuel
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 20 runners parallèles (limite GitHub Actions free tier)
+        batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Scrape batch
+        run: |
+          # Récupérer 100 IDs à scanner
+          BATCH=$(curl -s "https://wosforge.org/WPDS/api/get-batch?count=100")
+          IDS=$(echo $BATCH | jq -r '.ids[]' 2>/dev/null || echo "")
+
+          if [ -z "$IDS" ]; then
+            echo "No IDs to scrape or scan complete"
+            exit 0
+          fi
+
+          # Scanner chaque ID
+          FOUND=()
+          DEAD=()
+
+          for ID in $IDS; do
+            # Requête API WOS
+            RESPONSE=$(curl -s -X POST "https://sg-wos-api.leyi.com/api/getRoleDetail" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "fid=$ID" \
+              --max-time 5 || echo "")
+
+            # Parser réponse
+            if echo "$RESPONSE" | jq -e '.data.data.nickname' >/dev/null 2>&1; then
+              # Player trouvé
+              NICKNAME=$(echo "$RESPONSE" | jq -r '.data.data.nickname')
+              KID=$(echo "$RESPONSE" | jq -r '.data.data.kid // 0')
+              STATE_LEVEL=$(echo "$RESPONSE" | jq -r '.data.data.stateLevel // 0')
+
+              FOUND+=("{\"id\":$ID,\"nickname\":\"$NICKNAME\",\"kid\":$KID,\"stateLevel\":$STATE_LEVEL}")
+            else
+              # Dead ID
+              DEAD+=("$ID")
+            fi
+          done
+
+          # POST résultats au serveur
+          FOUND_JSON=$(echo ${FOUND[@]} | jq -s '.' 2>/dev/null || echo "[]")
+          DEAD_JSON=$(echo [${DEAD[@]}] | jq -c '.' 2>/dev/null || echo "[]")
+
+          curl -s -X POST "https://wosforge.org/WPDS/api/bulk-insert" \
+            -H "Content-Type: application/json" \
+            -d "{\"found\":$FOUND_JSON,\"dead\":$DEAD_JSON}"
+
+          echo "Batch ${{ matrix.batch }}: Scanned $(echo $IDS | wc -w) IDs, Found: ${#FOUND[@]}, Dead: ${#DEAD[@]}"
