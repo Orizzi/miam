@@ -69,3 +69,44 @@ MAIS mesure du débit SOUTENU (90s, pool 397) :
 5. Le système proxy hybride reste COMPLET sur `feat/proxy-hybride`, prêt pour des **proxies PAYANTS** (rapides/fiables/peu de CPU) qui eux le rendraient gagnant.
 
 → Prod = retour à la config optimale TOR 8 instances. Surveillance + rapport final ensuite.
+
+---
+
+# 🌙 RAPPORT FINAL DE LA NUIT (19/06/2026)
+
+## Ce qui a été fait
+1. **Découverte massive de sources** (recherches EN/RU/ZH) : ~25 sources, dont les meilleures = ProxyScrape filtré `timeout=2000` + listes vérifiées (databay-labs, ClearProxy, proxifly, ProxyGenerator).
+2. **Système proxy hybride complet** (branche `feat/proxy-hybride`, jamais en prod par défaut) :
+   - Cadence par proxy (anti-429), accumulation persistée (pool 35→453), cache agents keep-alive, pénalité d'échec progressive, sources vérifiées, fix fetch race-timeout, image Docker stable (agents intégrés, défaut `PROXY_MODE=tor`).
+   - Instrumentation : `sourceMetrics` (débit/source) + `proxyFails` (causes d'échec) + dashboard 2 îlots TOR/Proxy (sur la branche).
+3. **Cleanup** : 40 fichiers obsolètes → `archive/` ; README WPDS complet ; monitoring serveur 5 min.
+4. **5 commits** sur `feat/proxy-hybride`.
+
+## Verdict technique (le point demandé : pourquoi les proxies échouent)
+- **Le code/paramétrage est PARFAIT** : 0 rejet WOS (403/4xx/parse/429≈0) sur ~10 mesures. Headers variés + signature OK, identique à TOR.
+- **Cause des échecs = 61% de TIMEOUT** : les proxies gratuits, rapides en test isolé (~2s), **dégradent sous usage concurrent** (partagés/surchargés) + le serveur est **CPU-bound** (chaque requête proxy = un handshake TLS coûteux).
+- **Conséquence** : même avec un gros pool accumulé (≈400), débit proxy soutenu ≈ 7-33/s/instance, et le travail CPU du proxy **fait chuter le total du serveur** (112/s vs 160/s).
+
+## Meilleure config / meilleur débit
+| Config | Débit | Note |
+|---|---|---|
+| **TOR pur, 8 instances multi-process** | **~160/s** (pic) | ✅ OPTIMAL sur ce serveur (tag `tor-8inst-stable`) |
+| Proxy hybride (gratuit) wpds1 | ~7-33/s | CPU-bound + 61% timeout → ≤ TOR, pénalise le serveur |
+| Baseline initiale (1 process tor) | 2,5/s | ×64 d'amélioration jusqu'à 160/s |
+
+## Recommandations pour aller au-delà (vision « 700-5000/s »)
+La cadence-par-proxy permet THÉORIQUEMENT `N_proxies / cadence` (ex 3000/1,5s = 2000/s). Le code est prêt. Les 2 vrais leviers :
+1. **Proxies PAYANTS** (datacenter rotatifs, ~2s mais fiables ≈99% et faible CPU) : injectables direct dans le pool → débloquerait le débit ET soulagerait le CPU.
+2. **Serveur plus gros** (le goulot dur ici = 6 cœurs CPU-bound sur le TLS). Plus de cœurs → plus de workers proxy efficaces.
+Avec free proxies + ce serveur, le plafond réaliste reste ~160/s (TOR).
+
+## État prod au matin
+- 8 instances **TOR pur**, débit global **~105-160/s** (oscille selon la latence TOR + la zone scannée), charge **~4,3/6 cœurs**, isolation OK (cpus 0,5).
+- Couverture garantie intacte (chaque ID → found/dead/retest).
+- Branche `feat/proxy-hybride` = tout le travail proxy, prête pour proxies payants. `main`/`tor-8inst-stable` = prod stable.
+
+## ⚠️ Nuance importante (mesurée à 03:40)
+Sans le proxy, la **charge CPU tombe à 4,3/6** → le serveur a de la **MARGE CPU** ; le débit TOR (~105/s à cet instant) est alors limité par la **latence réseau TOR + la densité de la zone scannée**, PAS par le CPU. Donc :
+- Le proxy gratuit pénalisait surtout via les **pics CPU de ses refreshs** (test de centaines de proxies) ; en régime, son coût était moindre.
+- **Piste future à CPU disponible** : des **proxies payants** (fiables, peu de timeouts) ajouteraient leur débit EN PLUS de TOR sans pénaliser (la marge CPU existe). C'est la voie la plus prometteuse vers >200/s.
+- Côté TOR seul : le débit plafonne sur le réseau TOR, pas le serveur → ajouter des instances TOR donne des rendements décroissants (déjà testé : 8 = sweet spot).
