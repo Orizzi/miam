@@ -1,0 +1,202 @@
+version: '3.8'
+
+services:
+  wpds1:
+    container_name: wpds1
+    build: .
+    restart: unless-stopped
+    cpus: 0.5
+    volumes:
+      - ./data:/app/data  # ✅ DB UNIFIÉE partagée
+      - ./proxy-lists:/app/data/proxy-lists
+    environment:
+      - TOR_HOST=172.18.0.1
+      - TOR_PORT_START=30000
+      - TOR_PORT_END=30099
+      - TOR_PORTS_COUNT=100
+      # ✅ Couverture exhaustive : wpds1 scanne 1 → 167M
+      - INSTANCE_ID=1
+      - RETRY_ONLY=false
+      - SCAN_START=1
+      - SCAN_END=167000000
+      - CF_WORKER_SECRET=${CF_WORKER_SECRET}
+      - CF_WORKER_URL=${CF_WORKER_URL}
+    ports:
+      - "4242:4242"
+    networks:
+      - infra_default
+
+  wpds2:
+    container_name: wpds2
+    build: .
+    restart: unless-stopped
+    cpus: 0.5
+    volumes:
+      - ./data:/app/data  # ✅ MÊME DB que wpds1
+      - ./proxy-lists:/app/data/proxy-lists
+    environment:
+      - TOR_HOST=172.18.0.1
+      - TOR_PORT_START=30100
+      - TOR_PORT_END=30199
+      - TOR_PORTS_COUNT=100
+      # ✅ Couverture exhaustive : wpds2 scanne 167M → 334M
+      - INSTANCE_ID=2
+      - RETRY_ONLY=false
+      - SCAN_START=167000000
+      - SCAN_END=334000000
+      - CF_WORKER_SECRET=${CF_WORKER_SECRET}
+      - CF_WORKER_URL=${CF_WORKER_URL}
+    ports:
+      - "4243:4242"
+    networks:
+      - infra_default
+
+  wpds3:
+    container_name: wpds3
+    build: .
+    restart: unless-stopped
+    cpus: 0.5
+    volumes:
+      - ./data:/app/data  # ✅ MÊME DB que wpds1
+      - ./proxy-lists:/app/data/proxy-lists
+    environment:
+      - TOR_HOST=172.18.0.1
+      - TOR_PORT_START=30200
+      - TOR_PORT_END=30299
+      - TOR_PORTS_COUNT=100
+      # ✅ Couverture exhaustive : wpds3 scanne 334M → 500M
+      - INSTANCE_ID=3
+      - RETRY_ONLY=false
+      - SCAN_START=334000000
+      - SCAN_END=500000000
+      - CF_WORKER_SECRET=${CF_WORKER_SECRET}
+      - CF_WORKER_URL=${CF_WORKER_URL}
+    ports:
+      - "4244:4242"
+    networks:
+      - infra_default
+
+  wpds4:
+    container_name: wpds4
+    build: .
+    restart: unless-stopped
+    cpus: 0.5
+    volumes:
+      - ./data:/app/data  # ✅ MÊME DB que wpds1
+      - ./proxy-lists:/app/data/proxy-lists
+    environment:
+      - TOR_HOST=172.18.0.1
+      - TOR_PORT_START=30300
+      - TOR_PORT_END=30399
+      - TOR_PORTS_COUNT=100
+      # ✅ wpds4 DÉDIÉ AU RETEST des erreurs (fallback scan 1→500M si liste vide)
+      - INSTANCE_ID=4
+      - RETRY_ONLY=true
+      - SCAN_START=1
+      - SCAN_END=500000000
+      - CF_WORKER_SECRET=${CF_WORKER_SECRET}
+      - CF_WORKER_URL=${CF_WORKER_URL}
+    ports:
+      - "4245:4242"
+    networks:
+      - infra_default
+
+  wpds5:
+    container_name: wpds5
+    build: .
+    restart: unless-stopped
+    cpus: 0.5
+    volumes:
+      - ./data:/app/data
+      - ./proxy-lists:/app/data/proxy-lists
+    environment:
+      - TOR_HOST=172.18.0.1
+      - TOR_PORT_START=30400
+      - TOR_PORT_END=30499
+      - TOR_PORTS_COUNT=100
+      - INSTANCE_ID=5
+      - RETRY_ONLY=false
+      - SCAN_START=500000000
+      - SCAN_END=575000000
+      - CF_WORKER_SECRET=${CF_WORKER_SECRET}
+      - CF_WORKER_URL=${CF_WORKER_URL}
+    ports:
+      - "4246:4242"
+    networks:
+      - infra_default
+
+  wpds6:
+    container_name: wpds6
+    build: .
+    restart: unless-stopped
+    cpus: 0.5
+    volumes:
+      - ./data:/app/data
+      - ./proxy-lists:/app/data/proxy-lists
+    environment:
+      - TOR_HOST=172.18.0.1
+      - TOR_PORT_START=30500
+      - TOR_PORT_END=30599
+      - TOR_PORTS_COUNT=100
+      - INSTANCE_ID=6
+      - RETRY_ONLY=false
+      - SCAN_START=575000000
+      - SCAN_END=650000000
+      - CF_WORKER_SECRET=${CF_WORKER_SECRET}
+      - CF_WORKER_URL=${CF_WORKER_URL}
+    ports:
+      - "4247:4242"
+    networks:
+      - infra_default
+
+  wpds7:
+    container_name: wpds7
+    build: .
+    restart: unless-stopped
+    cpus: 0.5
+    volumes:
+      - ./data:/app/data
+      - ./proxy-lists:/app/data/proxy-lists
+    environment:
+      - TOR_HOST=172.18.0.1
+      - TOR_PORT_START=30600
+      - TOR_PORT_END=30699
+      - TOR_PORTS_COUNT=100
+      - INSTANCE_ID=7
+      - RETRY_ONLY=false
+      - SCAN_START=650000000
+      - SCAN_END=725000000
+      - CF_WORKER_SECRET=${CF_WORKER_SECRET}
+      - CF_WORKER_URL=${CF_WORKER_URL}
+    ports:
+      - "4248:4242"
+    networks:
+      - infra_default
+
+  wpds8:
+    container_name: wpds8
+    build: .
+    restart: unless-stopped
+    cpus: 0.5
+    volumes:
+      - ./data:/app/data
+      - ./proxy-lists:/app/data/proxy-lists
+    environment:
+      - TOR_HOST=172.18.0.1
+      - TOR_PORT_START=30700
+      - TOR_PORT_END=30799
+      - TOR_PORTS_COUNT=100
+      - INSTANCE_ID=8
+      - RETRY_ONLY=false
+      - SCAN_START=725000000
+      - SCAN_END=800000000
+      - CF_WORKER_SECRET=${CF_WORKER_SECRET}
+      - CF_WORKER_URL=${CF_WORKER_URL}
+    ports:
+      - "4249:4242"
+    networks:
+      - infra_default
+
+networks:
+  infra_default:
+    external: true

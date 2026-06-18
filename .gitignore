@@ -1,0 +1,25 @@
+# ─── Secrets — NE JAMAIS COMMITTER ───
+ssh_private_keys/
+ssh_keys.txt
+*deploy-key*
+id_ed25519*
+emails.txt
+*proxies*.txt
+mega-proxies.txt
+*.pem
+*.key
+.env
+.env.*
+
+# ─── Données / volumineux / générés ───
+node_modules/
+*.db
+*.sqlite
+*.tar.gz
+*.tgz
+captcha.jpg
+incident-*.tgz
+
+# ─── Backups DB rapatriés (hors-serveur) ───
+wpds-backups/
+*.db.gz

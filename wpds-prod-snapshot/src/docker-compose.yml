@@ -1,0 +1,27 @@
+services:
+  wpds:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    container_name: wpds
+    restart: unless-stopped
+    mem_limit: 4g
+    memswap_limit: 6g
+    ports:
+      - "4242:4242"
+    volumes:
+      - wpds_data:/app/data
+    environment:
+      - PORT=4242
+      - NODE_ENV=production
+      - CF_WORKER_URL=https://wpds-proxy.orizzi-wpds.workers.dev
+      - CF_WORKER_SECRET=gHUhQyPfK2R5hnETeeMNGfOCP8-BlLxx
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  wpds_data:
+    name: wpds_data
