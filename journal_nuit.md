@@ -52,3 +52,20 @@ Mesures (fenêtres 30-60s, BRUITÉES — le débit suit la taille du pool du mom
 - Goulot réel = (a) **~50% des proxies "vérifiés" timeoutent sous usage** (free = flaky), (b) **CPU-bound** sur le TLS (2 cœurs).
 - Débit/cœur : proxy ~15/s/cœur vs TOR ~27/s/cœur (160/s sur 6 cœurs). Sur CE serveur, TOR reste plus efficace au cœur.
 - L'accumulation du pool n'a pas eu le temps d'opérer (je redémarrais wpds1 sans cesse pour tester). **Décision : laisser wpds1 tourner pour accumuler** (pool persistant grossit aux refreshs /5min) et mesurer la montée via le monitor, pendant le cleanup/README.
+
+## 02:30-03:25 — Accumulation longue + VERDICT DÉFINITIF
+Cleanup fait (40 fichiers → `archive/`), README WPDS écrit, monitoring serveur actif (journal_nuit_serveur.log).
+Refresh adouci (12 min + top-up léger quand pool sain) pour réduire la perturbation CPU.
+**Accumulation confirmée : pool 35 → 264 → 314 → 397** (persistance OK, le pool grossit et tient).
+MAIS mesure du débit SOUTENU (90s, pool 397) :
+- **proxy 7,1/s + tor 2/s = 9/s** ; **timeout = 61%** (cumulé 18894/31000)
+- **Global système = ~112/s** (vs 160/s en TOR pur 8 instances)
+
+**VERDICT (étayé par ~10 mesures sur la nuit)** :
+1. Le paramétrage requêtes est PARFAIT (0 rejet WOS). Le système proxy est correct, robuste, accumule, 0 lib manquante.
+2. Les **proxies GRATUITS timeoutent ~61% sous usage soutenu** (rapides en test isolé mais dégradent sous charge concurrente — ils sont partagés/surchargés).
+3. Sur ce serveur **6 cœurs CPU-limité**, le travail proxy de wpds1 (TLS lourd) **fait CHUTER le total à 112/s** au lieu de 160. Le proxy gratuit n'égale PAS TOR ici, il le pénalise.
+4. **Meilleure performance = TOR pur 8 instances (~160/s)**. → wpds1 REMIS en TOR pur (03:25).
+5. Le système proxy hybride reste COMPLET sur `feat/proxy-hybride`, prêt pour des **proxies PAYANTS** (rapides/fiables/peu de CPU) qui eux le rendraient gagnant.
+
+→ Prod = retour à la config optimale TOR 8 instances. Surveillance + rapport final ensuite.
