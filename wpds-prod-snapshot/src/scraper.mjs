@@ -18,7 +18,7 @@
 
 import pkg from "bloom-filters";
 const { BloomFilter } = pkg;
-import { fetchPlayer, fetchPlayerViaCF, fetchPlayerViaProxy, cfAvailable, poolStats } from "./api.mjs";
+import { fetchPlayer, fetchPlayerViaCF, fetchPlayerViaProxy, cfAvailable, poolStats, sourceMetrics } from "./api.mjs";
 import { savePlayer, markDead, isDead, getState, setState, logScan, getStats, pushEvent, logError, resolveError, getErrorsToRetry, countPendingErrors, db } from "./db.mjs";
 
 // ─── CircularQueue O(1) — Quick-Win #4 (+15-25% throughput) ──────────────────
@@ -155,10 +155,14 @@ const CONCURRENCY_CF    = 0;  // CF quota épuisé (reset minuit UTC)
 // TOR : 1 circuit par port (≈TOR_PORTS_COUNT circuits/instance). Il faut ALIGNER le
 // nombre de workers sur le nombre de circuits, sinon TOR sature (timeouts en cascade).
 // 2 workers/circuit = bon compromis (pipeline léger sans saturer).
-const TOR_PORTS_COUNT = parseInt(process.env.TOR_PORTS_COUNT || '25');  // 25 ports par instance
-const WORKERS_PER_PROXY = parseInt(process.env.WORKERS_PER_PROXY || '1');  // 1 worker par circuit TOR (test)
-const MIN_PROXY_WORKERS = TOR_PORTS_COUNT * WORKERS_PER_PROXY;
-const MAX_PROXY_WORKERS = TOR_PORTS_COUNT * WORKERS_PER_PROXY;
+const TOR_PORTS_COUNT = parseInt(process.env.TOR_PORTS_COUNT || '25');  // ports TOR / instance
+const WORKERS_PER_PROXY = parseInt(process.env.WORKERS_PER_PROXY || '1');  // 1 worker / circuit TOR
+// Mode proxy hybride : cap FIXE de workers, découplé du nombre de circuits TOR.
+// La latence proxy (~6s médian) impose BEAUCOUP de requêtes en vol pour le débit →
+// PROXY_WORKERS (défaut 400/instance). Si 0 → mode TOR historique (aligné sur les circuits).
+const PROXY_WORKERS = parseInt(process.env.PROXY_WORKERS || '0');
+const MIN_PROXY_WORKERS = PROXY_WORKERS > 0 ? PROXY_WORKERS : TOR_PORTS_COUNT * WORKERS_PER_PROXY;
+const MAX_PROXY_WORKERS = PROXY_WORKERS > 0 ? PROXY_WORKERS : TOR_PORTS_COUNT * WORKERS_PER_PROXY;
 
 let CONCURRENCY_PROXY = MIN_PROXY_WORKERS;
 let CONCURRENCY       = CONCURRENCY_CF + CONCURRENCY_PROXY;
@@ -727,9 +731,20 @@ async function scanComplet() {
 
   // Heartbeat : log du nombre de workers vivants toutes les 30s (détecte une hémorragie)
   const hb = setInterval(() => {
-    console.log(`💓 [heartbeat] workers vivants: ${aliveWorkers}/${CONCURRENCY_PROXY} | exceptions cumulées: ${workerExceptions}`);
+    // 📋 VÉRIF COUVERTURE : tout ID scanné doit finir en found, dead, ou loggé (errLog).
+    // scanned ≈ found + dead + errLog  → aucun ID ne part "dans le vide". pending = file de retest.
+    const errLog = (state.errorProxy || 0) + (state.errorTimeout || 0) + (state.error5xx || 0) + (state.errors || 0);
+    console.log(`💓 [heartbeat] workers ${aliveWorkers}/${CONCURRENCY_PROXY} | exc ${workerExceptions} | 📋 scanned=${state.scanned} → found=${state.found} dead=${state.dead} errLog=${errLog} | pending(retest)=${countPendingErrors()}`);
     if (!state.running) clearInterval(hb);
   }, 30_000);
+
+  // 📊 Compteurs de succès PAR SOURCE → DB (clé par instance), toutes les 3s.
+  // L'API dashboard agrège les 8 instances et en déduit le débit/s TOR vs proxy.
+  const srcTimer = setInterval(() => {
+    setState(`src_tor_${INSTANCE_ID}`, sourceMetrics.torSuccess);
+    setState(`src_proxy_${INSTANCE_ID}`, sourceMetrics.proxySuccess);
+    if (!state.running) clearInterval(srcTimer);
+  }, 3_000);
 
   updateProxyWorkers();
   console.log(`🔥 PHASE 1 — SCAN COMPLET [inst ${INSTANCE_ID}] : ${CONCURRENCY_PROXY} proxy workers ${RETRY_ONLY ? '(RETEST)' : '(SCAN)'}`);

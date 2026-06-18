@@ -10,13 +10,19 @@
 
 import http  from "node:http";
 import https from "node:https";
+import crypto from "node:crypto";
 import { SocksClient } from "socks";
+import { SocksProxyAgent } from "socks-proxy-agent";   // robuste : gère socks4/5 + auth (TOR isolation)
+import { HttpsProxyAgent } from "https-proxy-agent";   // robuste : tunnel HTTP CONNECT vers cible HTTPS
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-// ─── Solution 3: HYBRID mode - Tor + Public proxies together ─────────────────
-const TOR_ENABLED      = true;            // ✅ TOR PUR : getProxy → getTorProxy (round-robin O(1)), pas de pool public
-const TOR_HYBRID       = false;           // Plus de proxies publics (hunter/refresh/test désactivés)
+// ─── Mode de transport : 'tor' | 'proxy' | 'hybrid' ───────────────────────────
+// hybrid = proxies publics PRIORITAIRES + TOR en fallback (recommandé).
+// Défaut hybrid : déployer ce fichier bascule l'instance en mode proxy hybride.
+const PROXY_MODE       = process.env.PROXY_MODE || 'hybrid';
+const TOR_ENABLED      = PROXY_MODE !== 'proxy';    // TOR dispo (pur ou fallback)
+const TOR_HYBRID       = PROXY_MODE === 'hybrid';   // pool public actif + TOR en secours
 const TOR_PORT_START   = parseInt(process.env.TOR_PORT_START || '9050');
 const TOR_PORT_END     = parseInt(process.env.TOR_PORT_END || '9149');
 const TOR_PORTS        = Array.from({length: TOR_PORT_END - TOR_PORT_START + 1}, (_, i) => TOR_PORT_START + i);
@@ -25,13 +31,13 @@ let torProxiesInjected = false;
 const torPortCnt       = {};   // compteur d'usages par port (pour rotation désynchronisée des circuits)
 
 const REFRESH_INTERVAL = 5 * 60 * 1000;   // 5min (×4 refresh pour pool toujours frais)
-const TEST_TIMEOUT     = 10_000;          // 10s (accepter proxies lents mais fonctionnels WOS)
+const TEST_TIMEOUT     = 6_000;           // 6s : ne valider QUE les proxies rapides (aligné sur le timeout requête)
 const TEST_HOST        = "wos-giftcode-api.centurygame.com";   // Option B: Test contre WOS réel
 const TEST_PATH        = "/api/player?fid=701&_uid=1";
-const MAX_TEST_BATCH   = 1500;            // 1500 tests en parallèle (~1.5Kpps < 16Kpps limite OVH)
+const MAX_TEST_BATCH   = 3000;            // 3000 tests parallèles (remplir le pool plus vite)
 const MIN_POOL_SIZE    = 20;
-const MAX_FAILURES     = 6;               // 6 échecs avant retrait (plus tolérant)
-const COOLDOWN_MS      = 10_000;          // 10s de cooldown
+const MAX_FAILURES     = 12;              // tolérant : proxies publics instables → on les garde dans le pool
+const COOLDOWN_MS      = 5_000;           // 5s de cooldown (recyclage rapide vers alive)
 
 // ─── Source statistics tracking ───────────────────────────────────────────────
 const sourceStats = {
@@ -288,64 +294,71 @@ function httpGetViaSocks(proxy, targetHost, targetPort, path, timeoutMs) {
 
 // ─── POST via proxy (appel WOS) ───────────────────────────────────────────────
 
+// POST via proxy avec les AGENTS robustes (socks-proxy-agent / https-proxy-agent).
+// Bien plus fiable que l'implémentation CONNECT/SOCKS maison (mon test reco : 15% vivants
+// vs 1.1% maison). Gère aussi l'auth SOCKS → isolation des circuits TOR (userId/password).
 export function postViaProxy(proxy, targetHost, targetPort, path, body, headers, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+    let done = false, req;
+    const timer = setTimeout(() => { if (done) return; done = true; try { req?.destroy(); } catch {} reject(new Error("timeout")); }, timeoutMs);
+    const finish = (fn, arg) => { if (done) return; done = true; clearTimeout(timer); fn(arg); };
 
-    const doRequest = (socket) => {
-      const req = https.request({
-        host: targetHost, port: targetPort, path, method: "POST",
-        headers: { ...headers, "Content-Length": Buffer.byteLength(body) },
-        socket, agent: false, rejectUnauthorized: false,
-      });
-      req.on("error", (e) => { clearTimeout(timer); if (socket) socket.destroy(); reject(e); });
-      req.on("response", (res) => {
-        let data = "";
-        res.on("data", (c) => { data += c; });
-        res.on("end", () => { clearTimeout(timer); if (socket) socket.destroy(); resolve({ status: res.statusCode, body: data }); });
-      });
-      req.write(body);
-      req.end();
-    };
+    let agent;
+    try {
+      if (proxy.proto === "socks5" || proxy.proto === "socks4") {
+        // socks5://[user:pass@]host:port — l'auth force un circuit TOR dédié (stream-isolation)
+        const auth = proxy.userId ? `${encodeURIComponent(proxy.userId)}:${encodeURIComponent(proxy.password || "x")}@` : "";
+        agent = new SocksProxyAgent(`${proxy.proto}://${auth}${proxy.host}:${proxy.port}`);
+      } else {
+        agent = new HttpsProxyAgent(`http://${proxy.host}:${proxy.port}`);
+      }
+    } catch (e) { return finish(reject, e); }
 
-    if (proxy.proto === "socks5" || proxy.proto === "socks4") {
-      const type = proxy.proto === "socks4" ? 4 : 5;
-      const socksProxy = { host: proxy.host, port: proxy.port, type };
-      // Stream-isolation TOR : userId/password → circuit dédié
-      if (proxy.userId) { socksProxy.userId = proxy.userId; socksProxy.password = proxy.password || "x"; }
-      SocksClient.createConnection({
-        proxy: socksProxy,
-        command: "connect",
-        destination: { host: targetHost, port: targetPort },
-        timeout: timeoutMs,
-      }, (err, info) => {
-        if (err) { clearTimeout(timer); return reject(err); }
-        doRequest(info.socket);
-      });
-    } else {
-      const tunnel = http.request({
-        host: proxy.host, port: proxy.port, method: "CONNECT",
-        path: `${targetHost}:${targetPort}`,
-        headers: { Host: `${targetHost}:${targetPort}` },
-      });
-      tunnel.on("error", (e) => { clearTimeout(timer); reject(e); });
-      tunnel.on("connect", (res, socket) => {
-        if (res.statusCode !== 200) { socket.destroy(); clearTimeout(timer); return reject(new Error(`CONNECT ${res.statusCode}`)); }
-        doRequest(socket);
-      });
-      tunnel.end();
-    }
+    req = https.request({
+      host: targetHost, port: targetPort, path, method: "POST",
+      headers: { ...headers, "Content-Length": Buffer.byteLength(body) },
+      agent, rejectUnauthorized: false,
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => { data += c; });
+      res.on("end", () => finish(resolve, { status: res.statusCode, body: data }));
+    });
+    req.on("error", (e) => finish(reject, e));
+    req.write(body);
+    req.end();
   });
 }
 
-// ─── Test d'un proxy ─────────────────────────────────────────────────────────
+// ─── Test d'un proxy : POST RÉEL contre WOS (headers complets + signature) ────
+// ⚠️ BUG HISTORIQUE CORRIGÉ : l'ancien testProxy faisait un GET avec le seul header
+// "User-Agent: curl/7.88" → WOS répondait 403 → TOUS les bons proxies étaient rejetés
+// (d'où le faux "2% vivants"). On valide désormais EXACTEMENT comme en prod (POST + headers
+// WOS + signature MD5) → un proxy "vivant" l'est réellement pour le scraping.
+const WOS_HASH      = "tB87#kPtkxqOS2";
+const WOS_TEST_PATH = "/api/player";
+const TEST_UA = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+];
+function wosTestHeaders() {
+  return {
+    "User-Agent":   TEST_UA[Math.random() * TEST_UA.length | 0],
+    "Accept":       "application/json, text/plain, */*",
+    "Origin":       "https://wos-giftcode.centurygame.com",
+    "Referer":      "https://wos-giftcode.centurygame.com/",
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+}
+function wosTestBody(fid) {
+  const time = Date.now();
+  const sign = crypto.createHash("md5").update(`fid=${fid}&time=${time}${WOS_HASH}`).digest("hex");
+  return new URLSearchParams({ sign, fid: String(fid), time: String(time) }).toString();
+}
 
 async function testProxy(proxy) {
   try {
-    const ok = (proxy.proto === "socks5" || proxy.proto === "socks4")
-      ? await httpGetViaSocks(proxy, TEST_HOST, 443, TEST_PATH, TEST_TIMEOUT)
-      : await httpGetViaHttpProxy(proxy, TEST_HOST, 443, TEST_PATH, TEST_TIMEOUT);
-    return ok;
+    const res = await postViaProxy(proxy, TEST_HOST, 443, WOS_TEST_PATH, wosTestBody(701), wosTestHeaders(), TEST_TIMEOUT);
+    return res.status === 200;  // WOS répond OK via ce proxy → réellement utilisable
   } catch { return false; }
 }
 
@@ -424,63 +437,59 @@ export async function refreshPool() {
   }
 
   // Reset source stats for this refresh
-  sourceStats.attempted = 10; // 10 fichiers locaux
+  sourceStats.attempted = SOURCES.length;
   sourceStats.succeeded = 0;
   sourceStats.failed = 0;
   sourceStats.failedUrls = [];
   sourceStats.lastRefresh = Date.now();
 
-  // SOLUTION 1: Load from local files (no network timeouts!)
-  let all = loadProxiesFromLocalFiles();
-
-  console.log(`📊 Source stats: ${sourceStats.succeeded}/${sourceStats.attempted} fichiers OK (${((sourceStats.succeeded/sourceStats.attempted)*100).toFixed(1)}%)`);
-
-  // 🚀 BOOST MAXIMUM: Proxy Hunter RÉACTIVÉ (toutes sources)
+  // Charger depuis les SOURCES réseau (listes publiques) — fetch PARALLÈLE.
+  // (Les fichiers locaux /app/data/proxy-lists sont vides en prod → on scrape le réseau.)
   try {
-    const { huntAll } = await import('./proxy-hunter.mjs');
-    const hunted = await huntAll();
-    all.push(...hunted);
-    console.log(`🔎 Proxy Hunter ajouté ${hunted.length} proxies additionnels`);
-  } catch (err) {
-    console.error('⚠️  Proxy Hunter error:', err.message);
-  }
-  console.log(`🚀 BOOST: Proxy Hunter activé - recherche maximale de proxies`);
+    // Race timeout DUR par source : l'AbortSignal de fetch ne coupe pas toujours un
+    // connect TCP qui hang → sans ce race, Promise.all reste bloqué indéfiniment.
+    const withTimeout = (p, ms) => Promise.race([p, new Promise(r => setTimeout(() => r([]), ms))]);
+    const fetched = await Promise.all(SOURCES.map(src =>
+      withTimeout(
+        fetchText(src.url).then(({ success, text }) => success ? parseIpPort(text, src.proto) : []),
+        18_000
+      )
+    ));
+    let all = fetched.flat();
+    all.push(...loadProxiesFromLocalFiles());  // + fichiers locaux éventuels (souvent vide)
+    console.log(`📊 Sources: ${sourceStats.succeeded}/${SOURCES.length} OK → ${all.length} proxies bruts`);
 
-  // Dédupliquer — réutiliser les proxies déjà connus
-  const existing = new Map([...alive, ...cooldown.map(c=>c.proxy), ...dead.map(d=>d.proxy)].map(p => [`${p.host}:${p.port}`, p]));
-  const seen  = new Set([...alive, ...cooldown.map(c=>c.proxy), ...dead.map(d=>d.proxy)].map(p => `${p.host}:${p.port}`));
-  const fresh = [];
-  for (const p of all) {
-    const key = `${p.host}:${p.port}`;
-    if (!seen.has(key)) { seen.add(key); fresh.push(p); }
-  }
-
-  console.log(`🔄 ${fresh.length} nouveaux proxies à tester (batch ${MAX_TEST_BATCH}, timeout ${TEST_TIMEOUT}ms)...`);
-
-  // Tester les nouveaux proxies et les injecter dans alive au fur et à mesure
-  let added = 0;
-  for (let i = 0; i < fresh.length; i += MAX_TEST_BATCH) {
-    const batch   = fresh.slice(i, i + MAX_TEST_BATCH);
-    const results = await Promise.all(batch.map(async p => ({ p, ok: await testProxy(p) })));
-    for (const { p, ok } of results) {
-      if (ok) { p.failures = 0; p.score = 1; alive.push(p); added++; }
+    // Dédupliquer (ne pas re-tester ce qui est déjà connu vivant/cooldown/mort)
+    const seen = new Set([...alive, ...cooldown.map(c=>c.proxy), ...dead.map(d=>d.proxy)].map(p => `${p.host}:${p.port}`));
+    const fresh = [];
+    for (const p of all) {
+      const key = `${p.host}:${p.port}`;
+      if (!seen.has(key)) { seen.add(key); fresh.push(p); }
     }
-    const done = Math.min(i + MAX_TEST_BATCH, fresh.length);
-    process.stdout.write(`\r  testé ${done}/${fresh.length} — nouveaux vivants: ${added}   `);
+    console.log(`🔄 ${fresh.length} nouveaux proxies à tester (batch ${MAX_TEST_BATCH}, timeout ${TEST_TIMEOUT}ms)...`);
+
+    // Tester par batch ; injecter dans alive au fur et à mesure. Log \n VISIBLE par batch.
+    let added = 0, tested = 0;
+    for (let i = 0; i < fresh.length; i += MAX_TEST_BATCH) {
+      const batch   = fresh.slice(i, i + MAX_TEST_BATCH);
+      const results = await Promise.all(batch.map(async p => ({ p, ok: await testProxy(p) })));
+      let batchOk = 0;
+      for (const { p, ok } of results) {
+        if (ok) { p.failures = 0; p.score = 1; alive.push(p); added++; batchOk++; }
+      }
+      tested += batch.length;
+      console.log(`  🧪 batch testé ${tested}/${fresh.length} — +${batchOk} vivants (cumul ${added}, pool alive=${alive.length})`);
+      if (alive.length >= 4000) { console.log(`  ⏭️  pool large (${alive.length}) → test interrompu, le reste au prochain refresh`); break; }
+    }
+
+    lastFetch = Date.now();
+    const byProto = alive.reduce((a, p) => { a[p.proto] = (a[p.proto] || 0) + 1; return a; }, {});
+    console.log(`✅ Proxy pool : ${alive.length} vivants | ${cooldown.length} cooldown | ${dead.length} morts — ${JSON.stringify(byProto)}`);
+  } catch (err) {
+    console.error(`❌ refreshPool erreur: ${err.message}`);
+  } finally {
+    fetching = false;   // 🔒 GARDE-FOU : ne JAMAIS rester bloqué en fetching=true
   }
-  process.stdout.write("\n");
-
-  // HYBRID: Restore Tor proxies after refresh
-  if (savedTorProxies.length > 0) {
-    alive.push(...savedTorProxies);
-    console.log(`✅ HYBRID: Restored ${savedTorProxies.length} Tor proxies to pool`);
-  }
-
-  lastFetch = Date.now();
-  fetching  = false;
-
-  const byProto = alive.reduce((a, p) => { a[p.proto] = (a[p.proto] || 0) + 1; return a; }, {});
-  console.log(`✅ Proxy pool : ${alive.length} vivants | ${cooldown.length} en cooldown | ${dead.length} morts — ${JSON.stringify(byProto)}`);
 }
 
 // HYBRID: Injecter Tor AVANT de démarrer proxyManager pour éviter la boucle refresh
@@ -538,120 +547,86 @@ function injectTorProxies() {
   console.log(`✅ HYBRID: Pool now has ${alive.length} proxies (${TOR_PORTS.length} Tor + ${alive.length - TOR_PORTS.length} public)`);
 }
 
-export function getProxy(wid = 0) {
-  // TOR pur : circuit isolé par worker (wid)
-  if (TOR_ENABLED) {
-    return getTorProxy(wid);
-  }
-
-  promoteCooldowns();
-
-  // HYBRID: ALWAYS ensure Tor proxies are in pool (inject once at startup)
-  if (TOR_HYBRID && !torProxiesInjected) {
-    injectTorProxies();
-  }
-
+// Tirer un proxy public au hasard dans tout le pool vivant.
+// Random pur (pas de top-N) = diversité d'IP MAXIMALE → minimise le rate-limit WOS
+// par IP. Les morts/lents sont retirés par reportFailure (timeout 10s) → auto-régulation.
+function pickPublic() {
   if (alive.length === 0) return null;
+  // Tournoi à 2 : tire 2 candidats, garde le meilleur qualityScore → favorise les proxies
+  // RAPIDES/fiables (O(1), pas de tri global). Au début (scores nuls) ≈ random, puis les bons émergent.
+  const i1 = Math.floor(Math.random() * alive.length);
+  const i2 = Math.floor(Math.random() * alive.length);
+  const idx = (alive[i1]?.qualityScore || 0) >= (alive[i2]?.qualityScore || 0) ? i1 : i2;
+  return { proxy: alive[idx], idx };
+}
 
-  // 🎯 Ranking par qualité : trier et garder top 200 (revenir à TEST #2)
-  // HYBRID: NEVER remove Tor proxies from pool
-  if (alive.length > 200) {
-    alive.sort((a, b) => (b.qualityScore || 0) - (a.qualityScore || 0));
-
-    // In HYBRID mode, preserve all Tor proxies + top public proxies
-    if (TOR_HYBRID) {
-      const torProxies = alive.filter(p => p.isTor);
-      const publicProxies = alive.filter(p => !p.isTor);
-      const keepPublic = Math.max(0, 200 - torProxies.length);
-      const pruned = publicProxies.length - keepPublic;
-      // 🔧 FIX: alive est const (pool global) → mutation in-place, PAS de réassignation
-      alive.length = 0;
-      alive.push(...torProxies, ...publicProxies.slice(0, keepPublic));
-      if (pruned > 0) {
-        console.log(`🧹 [proxy] Éliminé ${pruned} proxies publics lents (gardé ${torProxies.length} Tor + ${keepPublic} publics)`);
-      }
-    } else {
-      const toRemove = alive.splice(200);
-      console.log(`🧹 [proxy] Éliminé ${toRemove.length} proxies lents (gardé top 200 par qualité)`);
-    }
+export function getProxy(wid = 0) {
+  // ─── HYBRIDE : proxy public PRIORITAIRE, TOR en fallback ───
+  if (TOR_HYBRID) {
+    promoteCooldowns();
+    const slot = pickPublic();
+    if (slot) return slot;          // proxy public dispo → on l'utilise
+    return getTorProxy(wid);        // pool public vide → fallback TOR (toujours dispo, circuit isolé)
   }
 
-  // Prendre un proxy random dans le top 80% (favorise les meilleurs)
-  const topN  = Math.max(1, Math.ceil(alive.length * 0.8));
-  const idx   = Math.floor(Math.random() * topN);
-  const proxy = alive[idx];
-  return { proxy, idx };
+  // ─── TOR pur ───
+  if (TOR_ENABLED) return getTorProxy(wid);
+
+  // ─── Proxy pur ───
+  promoteCooldowns();
+  return pickPublic();              // null si pool vide → probeId loggera l'ID (couverture garantie)
+}
+
+// Helper : un slot TOR (fallback) ne se track pas ; en TOR pur non plus.
+function skipTracking(slot) {
+  if (slot?.proxy?.isTor) return true;        // circuit TOR jetable
+  if (TOR_ENABLED && !TOR_HYBRID) return true; // TOR pur
+  return false;
 }
 
 export function reportFailure(slot) {
-  // Solution 3: Tor proxies don't fail (infinite pool)
-  if (TOR_ENABLED) return;
-
-  const idx = slot?.idx ?? slot;  // Support both old (idx) and new (slot) API
-  if (idx < 0 || idx >= alive.length) return;
+  if (skipTracking(slot)) return;
+  const idx = slot?.idx ?? slot;
+  if (idx == null || idx < 0 || idx >= alive.length) return;
   const p = alive[idx];
-  if (!p) return;  // 🛡️ Protection contre race condition
-
-  // HYBRID: Don't remove Tor proxies from pool (they're infinite)
-  if (TOR_HYBRID && p.isTor) {
-    // Just reset to end of queue, don't remove
-    alive.splice(idx, 1);
-    alive.push(p);
-    return;
-  }
-
+  if (!p) return;  // 🛡️ race condition (splice concurrent)
   p.failures = (p.failures || 0) + 1;
-  alive.splice(idx, 1);
+  // RÉTENTION FORTE : un échec ponctuel ne retire PAS le proxy du pool (les publics sont
+  // instables mais réutilisables). reportSuccess remet failures=0. On ne le sort QUE
+  // après MAX_FAILURES échecs cumulés sans succès → vraiment mort. → pool large et stable.
   if (p.failures >= MAX_FAILURES) {
-    // → pool morte : retest après 10min
+    alive.splice(idx, 1);
     dead.push({ proxy: p, retryAt: Date.now() + DEAD_RETRY_MS });
-  } else {
-    // → cooldown temporaire
-    cooldown.push({ proxy: p, until: Date.now() + COOLDOWN_MS * p.failures, reason: "failure" });
   }
 }
 
 export function reportRateLimit(slot) {
-  // Solution 3: Tor proxies don't need cooldown (just rotate to next port)
-  if (TOR_ENABLED) return;
-
-  const idx = slot?.idx ?? slot;  // Support both old (idx) and new (slot) API
-  if (idx < 0 || idx >= alive.length) return;
+  if (skipTracking(slot)) return;
+  const idx = slot?.idx ?? slot;
+  if (idx == null || idx < 0 || idx >= alive.length) return;
   const p = alive[idx];
-  if (!p) return;  // 🛡️ Protection contre race condition
-
-  // HYBRID: Tor proxies rotate automatically, don't cooldown
-  if (TOR_HYBRID && p.isTor) {
-    alive.splice(idx, 1);
-    alive.push(p);  // Move to end of queue
-    return;
-  }
-
+  if (!p) return;
   alive.splice(idx, 1);
-  // Cooldown 60s sans incrémenter failures — WOS rate-limit, laisser plus de temps
+  // Cooldown 60s sans incrémenter failures — WOS rate-limit l'IP, pas un proxy mort
   cooldown.push({ proxy: p, until: Date.now() + 60_000, reason: "rate_limit" });
 }
 
-export function reportSuccess(idx, latency = 0) {
-  // Solution 3: Tor proxies don't need tracking (always available)
-  if (TOR_ENABLED) return;
-
-  if (idx < 0 || idx >= alive.length) return;
+export function reportSuccess(slot, latency = 0) {
+  if (skipTracking(slot)) return;
+  const idx = slot?.idx ?? slot;
+  if (idx == null || idx < 0 || idx >= alive.length) return;
   const p = alive[idx];
-  if (!p) return;  // 🛡️ Protection contre race condition
-  p.failures = 0;
-
-  // 🎯 Tracking qualité proxy
+  if (!p) return;
+  p.failures      = 0;
   p.totalRequests = (p.totalRequests || 0) + 1;
   p.successes     = (p.successes || 0) + 1;
   p.totalLatency  = (p.totalLatency || 0) + latency;
   p.avgLatency    = p.totalLatency / p.totalRequests;
   p.successRate   = p.successes / p.totalRequests;
-  // Score = taux succès / latence (plus haut = meilleur)
   p.qualityScore  = (p.successRate * 1000) / (p.avgLatency + 100);
 }
 
-export function removeProxy(idx) { reportFailure(idx); }
+export function removeProxy(slot) { reportFailure(slot); }
 
 export function poolStats() {
   // Solution 3: Pure Tor pool stats
@@ -712,15 +687,18 @@ export function poolStats() {
     else scoreRanges.poor++;
   });
 
+  const torFallback = TOR_HYBRID ? TOR_PORTS.length : 0;
   return {
-    total: alive.length,
-    alive: alive.length,
+    // En hybride, total inclut le fallback TOR → poolStats().total n'est JAMAIS 0,
+    // donc les workers n'attendent pas pendant que le pool public se remplit.
+    total: alive.length + torFallback,
+    alive: alive.length + torFallback,
+    alivePublic: alive.length,
+    torFallback,
     cooldown: cooldown.length,
     dead: dead.length,
     byProto,
     lastFetch,
-    // HYBRID: Tor vs public proxy breakdown
-    ...(TOR_HYBRID && { torCount, publicCount }),
     // Option A: Source statistics
     sourceStats: {
       attempted: sourceStats.attempted,
@@ -740,13 +718,13 @@ export function poolStats() {
 }
 
 export function needsRefresh() {
-  // Solution 3: Tor never needs refresh
-  if (TOR_ENABLED) return false;
+  if (TOR_ENABLED && !TOR_HYBRID) return false;  // TOR pur : jamais de refresh
   return alive.length < MIN_POOL_SIZE || Date.now() - lastFetch > REFRESH_INTERVAL;
 }
 
 // ─── Démarrage ────────────────────────────────────────────────────────────────
 
 refreshPool();
-// TOR pur : pas de refresh périodique (le pool public est désactivé)
-if (!TOR_ENABLED) setInterval(refreshPool, REFRESH_INTERVAL);
+// Refresh périodique du pool public, SAUF en TOR pur (pool public désactivé).
+// En hybride/proxy : re-scrape les sources toutes les REFRESH_INTERVAL pour garder le pool frais.
+if (!(TOR_ENABLED && !TOR_HYBRID)) setInterval(refreshPool, REFRESH_INTERVAL);

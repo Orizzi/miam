@@ -25,6 +25,7 @@ let cachedStats = {
   cursors: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0 },  // position de scan de chaque instance (8)
   breakdown: { f30: 0, existing: 0, lords: 0 },  // répartition des joueurs (calculée toutes les 2s)
   deltas: {},         // avancement sur la dernière heure, calculé CÔTÉ SERVEUR (survit aux reloads de page)
+  srcRate: { tor: 0, proxy: 0 },  // débit/s PAR SOURCE de transport (TOR fallback vs proxy public)
   recentPlayers: [],
   kingdoms: [],
   timestamp: Date.now()
@@ -36,6 +37,7 @@ let _rateHist = [];         // [{ t, resolved }] sur les 30 dernières secondes
 let _tick = 0;              // compteur de cycles (kingdoms = lourd, rafraîchi moins souvent)
 let _minStartTs = null;     // plus ancien startTs des instances → uptime monotone (anti-clignotement)
 let _snapshots = [];        // [{ t, v:{...} }] sur ~65 min pour calculer les deltas /h côté serveur
+let _srcHist = [];          // [{ t, tor, proxy }] sur 30s → débit/s par source de transport
 
 // Fonction robuste pour lire les stats (JAMAIS de crash)
 function updateCachedStats() {
@@ -79,6 +81,23 @@ function updateCachedStats() {
         const oldest = _rateHist[0];
         const dt = (nowMs - oldest.t) / 1000;
         if (dt > 0) cachedStats.ratePerSec = +Math.max(0, (resolved - oldest.resolved) / dt).toFixed(1);
+      }
+
+      // Débit PAR SOURCE : somme des compteurs src_tor_* / src_proxy_* (toutes instances), fenêtre 30s
+      const srcRows = db.prepare("SELECT key, value FROM scan_state WHERE key LIKE 'src_tor_%' OR key LIKE 'src_proxy_%'").all();
+      let torSum = 0, proxySum = 0;
+      for (const r of srcRows) {
+        const v = parseInt(String(r.value).replace(/[^0-9-]/g, '')) || 0;  // robuste (quotes JSON éventuelles)
+        if (r.key.startsWith('src_tor_')) torSum += v; else proxySum += v;
+      }
+      _srcHist.push({ t: nowMs, tor: torSum, proxy: proxySum });
+      while (_srcHist.length > 1 && nowMs - _srcHist[0].t > 30_000) _srcHist.shift();
+      if (_srcHist.length > 1) {
+        const o = _srcHist[0], dt2 = (nowMs - o.t) / 1000;
+        if (dt2 > 0) {
+          cachedStats.srcRate.tor   = +Math.max(0, (torSum   - o.tor)   / dt2).toFixed(1);
+          cachedStats.srcRate.proxy = +Math.max(0, (proxySum - o.proxy) / dt2).toFixed(1);
+        }
       }
 
       // Compteurs de session (scanned/found) — informatifs, lus depuis scan_state
@@ -254,7 +273,8 @@ const server = http.createServer((req, res) => {
         currentId: cachedStats.currentId,
         cursors: cachedStats.cursors,
         sessionDuration: cachedStats.sessionDuration,
-        deltas: cachedStats.deltas
+        deltas: cachedStats.deltas,
+        srcRate: cachedStats.srcRate
       }));
     } else if (req.url === '/api/servers') {
       res.writeHead(200, { 'Content-Type': 'application/json' });

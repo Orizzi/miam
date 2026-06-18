@@ -151,14 +151,28 @@ export async function fetchPlayerViaCF(playerId) {
 
 // ─── Mode Proxy public ────────────────────────────────────────────────────────
 
+// 📊 Compteurs cumulés de succès (WOS 200) PAR SOURCE de transport.
+// Lus par le scraper et écrits en DB → l'API dashboard calcule le débit/s TOR vs proxy.
+export const sourceMetrics = { torSuccess: 0, proxySuccess: 0 };
+// 📊 DIAGNOSTIC : répartition des issues des requêtes PROXY PUBLIC (pas TOR).
+export const proxyFails = { ok: 0, s429: 0, s403: 0, s4xx: 0, s5xx: 0, parse: 0, timeout: 0, neterr: 0 };
+let _pfTick = 0;
+function pf(reason, latency) {
+  proxyFails[reason]++;
+  if (++_pfTick % 500 === 0) {
+    const t = proxyFails, tot = Object.values(t).reduce((a, b) => a + b, 0);
+    console.log(`📊 [proxyFails/${tot}] ok=${t.ok} timeout=${t.timeout} neterr=${t.neterr} 403=${t.s403} 4xx=${t.s4xx} 5xx=${t.s5xx} 429=${t.s429} parse=${t.parse}`);
+  }
+}
+
 export async function fetchPlayerViaProxy(playerId, wid = 0) {
   const body = buildBody(playerId);
 
-  // TOR pur : 1 SEULE tentative. Un circuit lent/mort → on logge l'ID pour retest
-  // (par l'instance 4) au lieu de bloquer le worker jusqu'à 3×timeout.
+  // 1 SEULE tentative. Circuit/proxy lent ou mort → on logge l'ID pour retest (couverture).
   for (let i = 0; i < 1; i++) {
     const slot = getProxy(wid);   // wid → circuit TOR isolé (stream-isolation SOCKS auth)
     if (!slot) return { error: "no_proxy" };
+    const isTor = !!slot.proxy?.isTor;
 
     try {
       const startTime = Date.now();
@@ -167,27 +181,30 @@ export async function fetchPlayerViaProxy(playerId, wid = 0) {
         WOS_HOST, 443, WOS_PATH,
         body,
         buildHeaders(),   // User-Agent varié à chaque requête
-        8_000
+        6_000   // 54% des proxies timeoutaient à 10s → on coupe à 6s (médiane des bons) : moins de temps gaspillé
       );
       const latency = Date.now() - startTime;
 
       if (result.status === 429) {
-        reportRateLimit(slot); continue; // proxy vivant mais WOS rate-limit → cooldown 60s
+        if (!isTor) pf('s429'); reportRateLimit(slot); continue; // WOS rate-limit
       }
       if (result.status >= 500) {
-        reportRateLimit(slot); continue; // erreur serveur WOS → proxy pas en cause
+        if (!isTor) pf('s5xx'); reportRateLimit(slot); continue; // erreur serveur WOS
       }
       if (result.status !== 200) {
-        reportFailure(slot); continue;   // vrai échec du proxy (4xx, etc.)
+        if (!isTor) pf(result.status === 403 ? 's403' : 's4xx'); reportFailure(slot); continue;
       }
 
       let data;
-      try { data = JSON.parse(result.body); } catch { reportFailure(slot); continue; }
+      try { data = JSON.parse(result.body); } catch { if (!isTor) pf('parse'); reportFailure(slot); continue; }
 
-      reportSuccess(slot.idx, latency);  // 🎯 Passer latence pour ranking qualité
+      // ✅ WOS 200 via cette source → compteur débit par source
+      if (isTor) sourceMetrics.torSuccess++; else { sourceMetrics.proxySuccess++; pf('ok'); }
+      reportSuccess(slot, latency);
       return parseResponse(data);
 
-    } catch {
+    } catch (e) {
+      if (!isTor) pf(/timeout/i.test(String(e?.message)) ? 'timeout' : 'neterr');
       reportFailure(slot);
     }
   }
