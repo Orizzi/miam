@@ -127,23 +127,28 @@ function updateCachedStats() {
       // Recent players (seulement vrais noms, pas les "lord" par défaut)
       // retested = 1 si l'ID a un enregistrement dans error_ids (donc il a échoué puis été retesté)
       try {
-        cachedStats.recentPlayers = db.prepare(`
-          SELECT
-            p.id,
-            p.nickname,
-            p.kid,
-            p.state_level,
-            p.alliance_tag,
-            p.first_seen,
-            p.last_seen,
-            p.inactive,
+        // 14 joueurs les plus récents (tous), + 6 RETESTÉS récents garantis (sinon noyés par les
+        // 7 scanners) → fusion + dédup (retested prioritaire) → les retests restent VISIBLES en rouge.
+        const recents = db.prepare(`
+          SELECT p.id, p.nickname, p.kid, p.state_level, p.alliance_tag, p.first_seen, p.last_seen, p.inactive, p.last_updated,
             CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END AS retested
-          FROM players p
-          LEFT JOIN error_ids e ON e.id = p.id
+          FROM players p LEFT JOIN error_ids e ON e.id = p.id AND e.resolved = 1
           WHERE p.nickname != 'lord' || p.id
-          ORDER BY p.last_updated DESC
-          LIMIT 20
+          ORDER BY p.last_updated DESC LIMIT 14
         `).all();
+        // ⚠️ Retests : on NE filtre PAS les lord+ID ici → l'utilisateur veut VOIR l'activité de
+        // retest même si le joueur retrouvé a un nom par défaut (marqué rouge). Les découvertes
+        // normales (ci-dessus) restent sans lords.
+        const retests = db.prepare(`
+          SELECT p.id, p.nickname, p.kid, p.state_level, p.alliance_tag, p.first_seen, p.last_seen, p.inactive, p.last_updated,
+            1 AS retested
+          FROM players p JOIN error_ids e ON e.id = p.id AND e.resolved = 1
+          ORDER BY p.last_updated DESC LIMIT 6
+        `).all();
+        const byId = new Map();
+        for (const r of [...retests, ...recents]) if (!byId.has(r.id)) byId.set(r.id, r);  // retest prioritaire
+        cachedStats.recentPlayers = [...byId.values()]
+          .sort((a, b) => b.last_updated - a.last_updated).slice(0, 20);
       } catch (e) {
         // Keep old data if query fails
       }

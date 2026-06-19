@@ -187,7 +187,7 @@ const stmts = {
   `),
 
   resolveError: db.prepare(`
-    UPDATE error_ids SET resolved = 1 WHERE id = ?
+    UPDATE error_ids SET resolved = 1, last_error = ? WHERE id = ?
   `),
 
   getErrorsToRetry: db.prepare(`
@@ -324,7 +324,9 @@ export function logError(id, errorType, retryDelayMs = 15 * 60 * 1000) {
  * Marque une erreur comme résolue (ID trouvé ou confirmé dead lors du rescan).
  */
 export function resolveError(id) {
-  stmts.resolveError.run(id);
+  // last_error = now → la ligne resolved=1 survit la fenêtre de purge (30min) à partir de la
+  // RÉSOLUTION → le dashboard peut marquer le joueur « retesté » (sinon purgé instantanément).
+  stmts.resolveError.run(Date.now(), id);
 }
 
 /**
