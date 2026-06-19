@@ -110,3 +110,12 @@ Sans le proxy, la **charge CPU tombe à 4,3/6** → le serveur a de la **MARGE C
 - Le proxy gratuit pénalisait surtout via les **pics CPU de ses refreshs** (test de centaines de proxies) ; en régime, son coût était moindre.
 - **Piste future à CPU disponible** : des **proxies payants** (fiables, peu de timeouts) ajouteraient leur débit EN PLUS de TOR sans pénaliser (la marge CPU existe). C'est la voie la plus prometteuse vers >200/s.
 - Côté TOR seul : le débit plafonne sur le réseau TOR, pas le serveur → ajouter des instances TOR donne des rendements décroissants (déjà testé : 8 = sweet spot).
+
+## Surveillance (2h, monitor serveur toutes les 5 min)
+- Débit global **soutenu ~97-111/s** (resolved +319k sur la fenêtre observée).
+- **File de retest (`pending`) en BAISSE** : ~1,61M → 1,42M → wpds4 (RETRY_ONLY) rattrape, **la garantie de couverture se complète** (les erreurs réseau finissent résolues).
+- Charge ~5,7/6, **8/8 conteneurs UP**, total résolu cumulé = **3,45 M** IDs (players + dead).
+- Aucune instance morte, aucun worker éteint, 0 exception non gérée — système robuste sur la durée.
+
+## TL;DR pour le réveil
+Tout est documenté ici + `wpds-prod-snapshot/README.md`. Prod = **TOR 8 instances ~100-160/s** (config optimale sur ce serveur). Le système **proxy hybride** (cadence/proxy + accumulation + keep-alive + sources vérifiées) est **complet et fonctionnel** sur `feat/proxy-hybride`, mais les **proxies GRATUITS plafonnent ≤ TOR ici** (61 % timeout sous charge). **Pour viser >200/s → proxies PAYANTS** (le code les accueille直接, et la marge CPU existe). 6 commits, racine nettoyée (archive/), couverture garantie intacte.
