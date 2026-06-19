@@ -117,5 +117,10 @@ Sans le proxy, la **charge CPU tombe à 4,3/6** → le serveur a de la **MARGE C
 - Charge ~5,7/6, **8/8 conteneurs UP**, total résolu cumulé = **3,45 M** IDs (players + dead).
 - Aucune instance morte, aucun worker éteint, 0 exception non gérée — système robuste sur la durée.
 
+## Bilan matin (~05:45)
+- Débit global **soutenu ~130-140/s** (mesuré 133/s ; le 105 noté à 03:40 était un creux TOR ponctuel — la moyenne sur 36 min = 139/s).
+- **1 025 940 joueurs trouvés** (cap du million franchi) · **4 451 504** IDs résolus au total · pending ~1,13 M (équilibre).
+- Charge 4,75/6, 8/8 conteneurs UP, 0 incident sur toute la nuit.
+
 ## TL;DR pour le réveil
 Tout est documenté ici + `wpds-prod-snapshot/README.md`. Prod = **TOR 8 instances ~100-160/s** (config optimale sur ce serveur). Le système **proxy hybride** (cadence/proxy + accumulation + keep-alive + sources vérifiées) est **complet et fonctionnel** sur `feat/proxy-hybride`, mais les **proxies GRATUITS plafonnent ≤ TOR ici** (61 % timeout sous charge). **Pour viser >200/s → proxies PAYANTS** (le code les accueille直接, et la marge CPU existe). 6 commits, racine nettoyée (archive/), couverture garantie intacte.
