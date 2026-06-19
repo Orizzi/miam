@@ -637,7 +637,7 @@ async function scanComplet() {
   if (scanId < SCAN_START || scanId > SCAN_END) scanId = SCAN_START;
 
   console.log(`\n=== PHASE 1 — SCAN COMPLET [inst ${INSTANCE_ID}] ${RETRY_ONLY
-    ? `RETRY-ONLY (retest erreurs, fallback scan ${SCAN_START}→${SCAN_END})`
+    ? `RETRY-ONLY (retest erreurs, fallback scan DESCENDANT ${SCAN_END}→${SCAN_START} = pince)`
     : `SCAN ${scanId} → ${SCAN_END}`} ===`);
 
   // Skip des IDs déjà connus, par blocs de 50k (requête SQL indexée, léger)
@@ -685,6 +685,33 @@ async function scanComplet() {
     return null;
   }
 
+  // ─── Fallback DESCENDANT (RETRY_ONLY) : depuis SCAN_END vers SCAN_START ───
+  // Quand la file de retest est vide, wpds4 scanne en DESCENDANT (500M→1) → forme une PINCE
+  // avec les scanners qui montent (wpds1/2/3) : la zone est couverte ~2× plus vite, sans doublon
+  // (ils se croisent puis chacun a fait sa moitié). Curseur descendant propre, persistant.
+  const DOWN_KEY = `cursor_inst_${INSTANCE_ID}_down`;
+  let downId = getState(DOWN_KEY, SCAN_END);
+  if (downId < SCAN_START || downId > SCAN_END) downId = SCAN_END;
+  let downBlockStart = downId + 1;
+  let knownSetDown = new Set();
+  function refreshKnownSetDown() {
+    const b = downId;
+    const a = Math.max(SCAN_START, downId - SCAN_BLOCK + 1);
+    knownSetDown = new Set(stmtKnownInRange.all(a, b, a, b).map(r => r.id));
+    downBlockStart = a;
+  }
+  let lastPersistDown = downId;
+  function nextScanIdDown() {
+    while (downId >= SCAN_START) {
+      if (downId < downBlockStart) refreshKnownSetDown();
+      const id = downId--;
+      if (lastPersistDown - downId >= 500) { setState(DOWN_KEY, downId); lastPersistDown = downId; }
+      if (knownSetDown.has(id)) { state.skipped++; continue; }
+      return id;
+    }
+    return null;
+  }
+
   // Source d'un ID pour un worker :
   //  - RETRY_ONLY : erreurs prioritaires, sinon scan (fallback si liste vide)
   //  - SCAN       : scan prioritaire, sinon (plage finie) aide au retest
@@ -692,7 +719,7 @@ async function scanComplet() {
     if (RETRY_ONLY) {
       refillRetry();
       if (retryQueue.length) return retryQueue.shift();
-      return nextScanId();
+      return nextScanIdDown();   // fallback DESCENDANT (pince avec les scanners montants)
     } else {
       const id = nextScanId();
       if (id != null) return id;
