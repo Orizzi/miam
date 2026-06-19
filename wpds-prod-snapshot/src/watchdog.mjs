@@ -148,13 +148,14 @@ export const watchdog = {
 
   _checkStaleErrors() {
     try {
-      // Auto-resolve errors older than 6h — they'll be retried fresh next time
-      const resolved = db.prepare(`
-        UPDATE error_ids SET resolved = 1
-        WHERE resolved = 0 AND last_error < ?
-      `).run(Date.now() - STALE_ERROR_MAX_AGE).changes;
-      if (resolved > 0) {
-        console.log(`🧹 [watchdog] Auto-resolved ${resolved} stale errors (> 6h)`);
+      // 🔁 PLUS D'ABANDON : avant, on marquait resolved=1 les erreurs >6h (puis purgées)
+      // → IDs PERDUS sans vraie réponse. Désormais on les GARDE en file (resolved=0) jusqu'à
+      // une vraie réponse (found/dead) → garantie de couverture. On logge juste le backlog ancien.
+      const old = db.prepare(`
+        SELECT COUNT(*) AS c FROM error_ids WHERE resolved = 0 AND last_error < ?
+      `).get(Date.now() - STALE_ERROR_MAX_AGE).c;
+      if (old > 0) {
+        console.log(`🔁 [watchdog] ${old} erreurs >6h CONSERVÉES en file (retest jusqu'à vraie réponse)`);
       }
 
       // Purge resolved rows if table is too large
